@@ -1,0 +1,1139 @@
+---
+title: "Salifort Motors: Suggestions for HR"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: united
+    highlight: tango
+---
+
+The goal of this project is to build predictive models that can provide insights to Human Resources (HR) of Salifort Motors.
+
+**Problem:**  
+Salifort Motors want to improve high turnover rate problem, because it is time-consuming and expensive to find, interview, and hire new employees.
+
+**The question to answer:**  
+What's likely to make the employee leave the company?
+
+**The task to do:**  
+Build a model that predicts whether or not an employee will leave the company.
+
+> **Note:** Since there are so many plots and their complexity and variety, they have been reinterpreted many times, so you will notice that sometimes information from later plots is mentioned in earlier plots to make the picture clearer. So if possible, please check all the plots yourself once and come back to read my interpretation to avoid confusion.
+
+*AI are involved in this analysis as an assistant*
+
+---
+
+## Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+# Install required packages if not already installed
+# install.packages(c("tidyverse", "caret", "xgboost", "randomForest",
+#                    "corrplot", "ggplot2", "dplyr", "tidyr", "scales",
+#                    "reshape2", "glmnet", "pROC", "ROSE"))
+
+library(tidyverse)
+library(caret)
+library(xgboost)
+library(randomForest)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(scales)
+library(reshape2)
+library(pROC)
+library(ROSE)
+
+set.seed(0)
+```
+
+---
+
+# EDA
+
+```{r load-data}
+# Import data file
+df0 <- read.csv("HR_comma_sep.csv")
+
+# Display first few rows of the dataframe
+head(df0)
+```
+
+Generally, data that needed are sufficient, all columns are valuable, easy to understand and relate with the goal of this project. But, there are some concern on satisfaction level because the score only might not reflect all the truth.
+
+The performance last evaluation and classification of salary are high, medium, and low seemingly valid, but like satisfaction level. They are still lack of context which valuable and give more understanding when combined with only dataset itself.
+
+First, we need to clean and prepare data for visualization and modeling to see what data want to tell us properly.
+
+```{r data-info}
+# Gather basic information about the data
+str(df0)
+summary(df0)
+```
+
+```{r column-names}
+# Display all column names
+names(df0)
+```
+
+### Data Cleaning
+
+```{r rename-columns}
+# There are some columns that need to be changed following best practices
+
+# Rename columns
+df0 <- df0 %>%
+  rename(
+    work_accident = Work_accident,
+    department = Department,
+    average_monthly_hours = average_montly_hours
+  )
+
+# Display all column names after the update
+names(df0)
+```
+
+```{r check-missing}
+# Check for missing values
+colSums(is.na(df0))
+```
+
+```{r check-duplicates}
+# Check for duplicates
+sum(duplicated(df0))
+```
+
+```{r view-duplicates}
+# Inspect some rows containing duplicates
+df0[duplicated(df0), ]
+```
+
+```{r drop-duplicates}
+# Drop duplicates and save resulting dataframe in a new variable
+data_subset <- df0[!duplicated(df0), ]
+
+# Display first few rows of new dataframe
+head(data_subset)
+```
+
+```{r check-booleans}
+# Check if there are some booleans which are not included in outlier checking
+print(unique(data_subset$work_accident))
+print(unique(data_subset$left))
+print(unique(data_subset$promotion_last_5years))
+```
+
+```{r boxplots-outliers, fig.width=15, fig.height=8}
+# Create boxplots to detect any outliers
+numeric_cols <- c("satisfaction_level", "last_evaluation", "number_project",
+                  "average_monthly_hours", "time_spend_company",
+                  "work_accident", "left", "promotion_last_5years")
+
+data_long <- data_subset %>%
+  select(all_of(numeric_cols)) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "value")
+
+ggplot(data_long, aes(y = value)) +
+  geom_boxplot() +
+  facet_wrap(~variable, nrow = 2, scales = "free_y") +
+  theme_minimal() +
+  labs(title = "Boxplots for Outlier Detection")
+```
+
+Raw boxplot itself did not give much information but very useful to inspect outlier. Plots above suggest that there are only extreme outliers on `time_spend_company`.
+
+```{r remove-outliers}
+# Determine the number of rows containing outliers in time_spend_company
+Q1 <- quantile(data_subset$time_spend_company, 0.25)
+Q3 <- quantile(data_subset$time_spend_company, 0.75)
+IQR_val <- Q3 - Q1
+
+upper_bound <- Q3 + 1.5 * IQR_val
+lower_bound <- Q1 - 1.5 * IQR_val
+
+data_filtered <- data_subset %>%
+  filter(time_spend_company >= lower_bound & time_spend_company <= upper_bound)
+
+# Count the number of rows removed
+outliers_removed <- nrow(data_subset) - nrow(data_filtered)
+cat("Number of rows removed due to outliers:", outliers_removed, "\n")
+```
+
+There are 824 rows of outliers, so I decide to remove them because they are acceptable amount to remove compare to the whole dataset and prevent skewed analysis and model is important, a few data we removed should not effect the result of modeling in bad way.
+
+```{r class-imbalance}
+# To check the target class imbalance
+table(data_filtered$left)
+prop.table(table(data_filtered$left)) * 100
+```
+
+As you can see data are quite imbalanced. If the portion is about 80-20, it is acceptable; in this case there are 83-17. However, XGBoost is robust with imbalanced data. Then I decided to try different versions of them.
+
+```{r column-names-filtered}
+names(data_filtered)
+```
+
+### Data Upsampling
+
+```{r prepare-upsampling}
+# Prepare data upsampled for model comparing
+X2 <- data_filtered %>% select(-left)
+y2 <- data_filtered$left
+```
+
+```{r train-test-split-upsampled}
+# Split data into 80/20 portion
+set.seed(0)
+train_idx2 <- createDataPartition(y2, p = 0.8, list = FALSE)
+X_tr2 <- X2[train_idx2, ]
+X_test2 <- X2[-train_idx2, ]
+y_tr2 <- y2[train_idx2]
+y_test2 <- y2[-train_idx2]
+```
+
+```{r train-val-split-upsampled}
+# Split train into 60/20 and 20 portion (val = 25% of 80% = 20% overall)
+val_idx2 <- createDataPartition(y_tr2, p = 0.25, list = FALSE)
+X_train2 <- X_tr2[-val_idx2, ]
+X_val2 <- X_tr2[val_idx2, ]
+y_train2 <- y_tr2[-val_idx2]
+y_val2 <- y_tr2[val_idx2]
+```
+
+```{r define-minority-majority}
+# Define 'majority data' and 'minority data'
+data_train2 <- X_train2
+data_train2$left <- y_train2
+data_minority <- data_train2[data_train2$left == 1, ]
+data_majority <- data_train2[data_train2$left == 0, ]
+```
+
+```{r upsample-minority}
+# Use resampling to upsample data minority
+minority_indices <- sample(nrow(data_minority), size = nrow(data_majority), replace = TRUE)
+data_minority_upsampled <- data_minority[minority_indices, ]
+```
+
+```{r combine-upsampled}
+# Combine 'data minority' with 'data majority' into data_upsampled
+data_upsampled <- rbind(data_majority, data_minority_upsampled)
+data_upsampled <- data_upsampled[sample(nrow(data_upsampled)), ]  # shuffle
+rownames(data_upsampled) <- NULL
+```
+
+```{r check-upsampled}
+# See if 'data_upsampled' combined correctly
+summary(data_upsampled)
+```
+
+```{r define-Xy-upsampled}
+# Define y_train as target class and X_train without target
+y_train2 <- data_upsampled$left
+X_train2 <- data_upsampled %>% select(-left)
+```
+
+```{r encode-categoricals-upsampled}
+# Change categorical variables to numerical using model.matrix (equivalent to get_dummies)
+encode_dummies <- function(df) {
+  cat_cols <- c("department", "salary")
+  df <- df %>%
+    mutate(across(all_of(cat_cols), as.factor))
+  dummies <- model.matrix(~ department + salary - 1, data = df)
+  df <- df %>% select(-all_of(cat_cols))
+  cbind(df, dummies)
+}
+
+X_train2 <- encode_dummies(X_train2)
+X_val2   <- encode_dummies(X_val2)
+X_test2  <- encode_dummies(X_test2)
+```
+
+```{r check-splits-upsampled}
+# Check if data was split properly
+cat("X_tr2:", nrow(X_tr2), "\n")
+cat("X_train2:", nrow(X_train2), "\n")
+cat("X_val2:", nrow(X_val2), "\n")
+cat("X_test2:", nrow(X_test2), "\n")
+cat("y_train2 class balance:\n")
+table(y_train2)
+```
+
+---
+
+# Visualization
+
+```{r heatmap, fig.width=10, fig.height=6}
+# Plot heatmap to see correlation between variables
+numeric_features <- data_filtered %>%
+  select(satisfaction_level, last_evaluation, number_project,
+         average_monthly_hours, time_spend_company)
+
+corr_matrix <- cor(numeric_features)
+corr_melted <- melt(corr_matrix)
+
+ggplot(corr_melted, aes(Var1, Var2, fill = value)) +
+  geom_tile() +
+  geom_text(aes(label = round(value, 2)), size = 3) +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = 0,
+                       limits = c(-1, 1)) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Correlation Matrix", x = "", y = "")
+```
+
+There are no correlations between variables.
+
+```{r scatter-hours-eval, fig.width=12, fig.height=7}
+ggplot(data_filtered, aes(x = average_monthly_hours, y = last_evaluation,
+                           color = factor(left))) +
+  geom_point(alpha = 0.5) +
+  scale_color_manual(values = c("steelblue", "tomato"),
+                     labels = c("Stayed", "Left")) +
+  labs(title = "Average Monthly Hours vs. Last Evaluation by Left",
+       x = "Average Monthly Hours", y = "Last Evaluation", color = "Left") +
+  theme_minimal()
+```
+
+From the plot most of people who left company work between about 125-160 hours with 0.45-0.58 evaluation score and 220-310 hours per month with 0.8-1 evaluation score.
+
+```{r scatter-hours-eval-promotion, fig.width=12, fig.height=7}
+ggplot(data_filtered, aes(x = average_monthly_hours, y = last_evaluation,
+                           color = factor(promotion_last_5years))) +
+  geom_point(alpha = 0.5) +
+  labs(title = "Average Monthly Hours vs. Last Evaluation by Promotion Last 5 Years",
+       x = "Average Monthly Hours", y = "Last Evaluation", color = "Promoted") +
+  theme_minimal()
+```
+
+There are no specific trend between Average Monthly Hours and Last Evaluation on left.
+
+```{r scatter-satisfaction-hours, fig.width=12, fig.height=7}
+ggplot(data_filtered, aes(x = average_monthly_hours, y = satisfaction_level,
+                           color = factor(left))) +
+  geom_point(alpha = 0.5) +
+  scale_color_manual(values = c("steelblue", "tomato"),
+                     labels = c("Stayed", "Left")) +
+  labs(title = "Satisfaction Level vs. Average Monthly Hours by Left",
+       x = "Average Monthly Hours", y = "Satisfaction Level", color = "Left") +
+  theme_minimal()
+```
+
+The groups of people that have satisfaction level between 0.35-0.45 with 125-160 average monthly hours could be the same group with the previous plot which is lower performance group with lower working hours. Another group is people who work between 240-320 hours with almost 0 satisfaction level also likely to be the high performance group.
+
+```{r scatter-satisfaction-eval, fig.width=12, fig.height=7}
+ggplot(data_filtered, aes(x = last_evaluation, y = satisfaction_level,
+                           color = factor(left))) +
+  geom_point(alpha = 0.5) +
+  scale_color_manual(values = c("steelblue", "tomato"),
+                     labels = c("Stayed", "Left")) +
+  labs(title = "Satisfaction Level vs. Last Evaluation by Left",
+       x = "Last Evaluation", y = "Satisfaction Level", color = "Left") +
+  theme_minimal()
+```
+
+The plot shows similar patterns — employees who left have satisfaction scores between 0.35-0.45 and another group is almost 0 with 0.78-0.98 last evaluation (high and low performance groups).
+
+```{r boxplot-satisfaction-dept, fig.width=12, fig.height=6}
+ggplot(data_filtered, aes(x = department, y = satisfaction_level)) +
+  geom_boxplot() +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Satisfaction Level by Departments",
+       x = "Departments", y = "Satisfaction Level")
+```
+
+Satisfaction level from every department is almost the same level of median and overall satisfaction level.
+
+```{r boxplot-eval-left, fig.width=8, fig.height=6}
+ggplot(data_filtered, aes(x = factor(left), y = last_evaluation)) +
+  geom_boxplot() +
+  labs(title = "Left vs. Last Evaluation", x = "Left", y = "Last Evaluation") +
+  theme_minimal()
+```
+
+Evaluation score range of leavers is wider compared to the stay group, supporting the previous plot about evaluation score — employees who left are high and low performance groups.
+
+```{r violin-eval-left, fig.width=8, fig.height=6}
+ggplot(data_filtered, aes(x = factor(left), y = last_evaluation)) +
+  geom_violin(fill = "steelblue", alpha = 0.7) +
+  labs(title = "Last Evaluation vs. Left", x = "Left", y = "Last Evaluation") +
+  theme_minimal()
+```
+
+Distribution of Last Evaluation of people who stay is equally distributed. People who left are in high performance (~0.8-1.0) and low performance (~0.4-0.6), but people in the middle range (~0.6-0.8) are more likely to stay.
+
+```{r scatter-hours-tenure, fig.width=12, fig.height=7}
+ggplot(data_filtered, aes(x = average_monthly_hours, y = time_spend_company,
+                           color = factor(left))) +
+  geom_point(alpha = 0.5) +
+  scale_color_manual(values = c("steelblue", "tomato"),
+                     labels = c("Stayed", "Left")) +
+  labs(title = "Average Monthly Hours vs. Time Spend Company by Left",
+       x = "Average Monthly Hours", y = "Time Spend Company", color = "Left") +
+  theme_minimal()
+```
+
+Employees tend to leave if work hours are close to 300 hours per month and more likely to leave if they worked for 4-5 years.
+
+```{r countplot-accident, fig.width=8, fig.height=6}
+ggplot(data_filtered, aes(x = factor(work_accident), fill = factor(left))) +
+  geom_bar(position = "dodge") +
+  scale_fill_manual(values = c("steelblue", "tomato"),
+                    labels = c("Stayed", "Left")) +
+  labs(title = "Work Accident by Left", x = "Work Accident", y = "Count", fill = "Left") +
+  theme_minimal()
+```
+
+```{r accident-proportions}
+cat("Never had accident group left portion:", 1781/(7684+1781), "\n")
+cat("Had accident group left portion:", 101/(1601+101), "\n")
+```
+
+The plot above suggests that in the had-accident group, employees have a lower proportion of left. Then accident should not be the main reason that influences employees to leave.
+
+```{r violin-hours-accident, fig.width=8, fig.height=6}
+ggplot(data_filtered, aes(x = factor(work_accident), y = average_monthly_hours)) +
+  geom_violin(fill = "steelblue", alpha = 0.7) +
+  labs(title = "Average Monthly Hours vs. Work Accident",
+       x = "Work Accident", y = "Average Monthly Hours") +
+  theme_minimal()
+```
+
+```{r barplot-projects-hours-accident, fig.width=10, fig.height=6}
+ggplot(data_filtered, aes(x = factor(number_project), y = average_monthly_hours,
+                           fill = factor(work_accident))) +
+  stat_summary(fun = mean, geom = "bar", position = "dodge") +
+  labs(title = "Number Project vs. Average Monthly Hours by Work Accident",
+       x = "Number Project", y = "Average Monthly Hours", fill = "Work Accident") +
+  theme_minimal()
+```
+
+Plot strongly indicates that if the number of projects is increased, employees will have more average monthly hours and work accidents will increase.
+
+```{r boxplot-satisfaction-left, fig.width=8, fig.height=6}
+ggplot(data_filtered, aes(x = factor(left), y = satisfaction_level)) +
+  geom_boxplot() +
+  labs(title = "Left vs. Satisfaction Level", x = "Left", y = "Satisfaction Level") +
+  theme_minimal()
+```
+
+The plot strongly suggests that employees tend to leave if their satisfaction is low.
+
+```{r line-tenure-satisfaction, fig.width=10, fig.height=6}
+data_filtered %>%
+  group_by(time_spend_company) %>%
+  summarise(mean_satisfaction = mean(satisfaction_level)) %>%
+  ggplot(aes(x = time_spend_company, y = mean_satisfaction)) +
+  geom_line() +
+  geom_point() +
+  labs(title = "Time Spend Company vs. Satisfaction Level",
+       x = "Time Spend Company", y = "Satisfaction Level") +
+  theme_minimal()
+```
+
+Satisfaction level is very high from year 2 then dropping to year 3 and dramatically drops in year 4, but starts higher at year 5.
+
+```{r line-tenure-eval, fig.width=10, fig.height=6}
+data_filtered %>%
+  group_by(time_spend_company) %>%
+  summarise(mean_eval = mean(last_evaluation)) %>%
+  ggplot(aes(x = time_spend_company, y = mean_eval)) +
+  geom_line() +
+  geom_point() +
+  labs(title = "Time Spend Company vs. Last Evaluation",
+       x = "Time Spend Company", y = "Last Evaluation") +
+  theme_minimal()
+```
+
+```{r line-tenure-hours, fig.width=10, fig.height=6}
+data_filtered %>%
+  group_by(time_spend_company) %>%
+  summarise(mean_hours = mean(average_monthly_hours)) %>%
+  ggplot(aes(x = time_spend_company, y = mean_hours)) +
+  geom_line() +
+  geom_point() +
+  labs(title = "Time Spend Company vs. Average Monthly Hours",
+       x = "Time Spend Company", y = "Average Monthly Hours") +
+  theme_minimal()
+```
+
+```{r countplot-tenure-left, fig.width=10, fig.height=6}
+ggplot(data_filtered, aes(x = factor(time_spend_company), fill = factor(left))) +
+  geom_bar(position = "dodge") +
+  scale_fill_manual(values = c("steelblue", "tomato"),
+                    labels = c("Stayed", "Left")) +
+  labs(title = "Time Spend Company by Left", x = "Time Spend Company",
+       y = "Count", fill = "Left") +
+  theme_minimal()
+```
+
+People seem to leave company after 2 years of work. At 2 years people leave least but at year 3, 4, 5 turnover rate dramatically increases.
+
+```{r line-salary-proportion, fig.width=10, fig.height=6}
+salary_time <- data_filtered %>%
+  group_by(time_spend_company, salary) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  group_by(time_spend_company) %>%
+  mutate(proportion = count / sum(count))
+
+ggplot(salary_time, aes(x = time_spend_company, y = proportion,
+                         color = salary, group = salary)) +
+  geom_line() +
+  geom_point() +
+  labs(title = "Salary Proportion Over Time in Company",
+       x = "Time Spent in Company (Years)", y = "Proportion of Employees",
+       color = "Salary Level") +
+  theme_minimal()
+```
+
+Even if it seems not significant, salary proportion relates with the time spend company — low salary portion starts increasing until year 5 (sharp increase), while high salary proportion is completely the opposite shape.
+
+```{r countplot-tenure-salary, fig.width=12, fig.height=6}
+ggplot(data_filtered, aes(x = factor(time_spend_company),
+                           fill = factor(salary, levels = c("low","medium","high")))) +
+  geom_bar(position = "dodge") +
+  labs(title = "Time Spend Company by Salary", x = "Time Spend Company",
+       y = "Count", fill = "Salary") +
+  theme_minimal()
+```
+
+```{r violin-projects-tenure, fig.width=12, fig.height=6}
+ggplot(data_filtered, aes(x = factor(time_spend_company), y = number_project)) +
+  geom_violin(fill = "steelblue", alpha = 0.7) +
+  labs(title = "Time Spent vs. Number of Projects",
+       x = "Time Spend Company", y = "Number Project") +
+  theme_minimal()
+```
+
+```{r violin-hours-left, fig.width=8, fig.height=6}
+ggplot(data_filtered, aes(x = factor(left), y = average_monthly_hours)) +
+  geom_violin(fill = "steelblue", alpha = 0.7) +
+  labs(title = "Left vs. Average Monthly Hours", x = "Left",
+       y = "Average Monthly Hours") +
+  theme_minimal()
+```
+
+```{r countplot-promotion-left, fig.width=8, fig.height=6}
+ggplot(data_filtered, aes(x = factor(promotion_last_5years), fill = factor(left))) +
+  geom_bar(position = "dodge") +
+  scale_fill_manual(values = c("steelblue", "tomato"),
+                    labels = c("Stayed", "Left")) +
+  labs(title = "Promotion Last 5 Years by Left",
+       x = "Promotion Last 5 Years", y = "Count", fill = "Left") +
+  theme_minimal()
+```
+
+```{r countplot-dept, fig.width=12, fig.height=6}
+dept_counts <- data_filtered %>%
+  count(department) %>%
+  arrange(desc(n))
+
+ggplot(dept_counts, aes(x = reorder(department, -n), y = n)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  geom_text(aes(label = n), vjust = -0.5, size = 3) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Number of Departments", x = "Departments", y = "Count")
+```
+
+The highest number of employees is Sales (2997), Technical (2114), Support (1721), IT (915), R&D (649), Product Manager (641), Marketing (617), Accounting (583), HR (570), and Management (360) respectively.
+
+```{r countplot-dept-left, fig.width=12, fig.height=6}
+ggplot(data_filtered, aes(x = department, fill = factor(left))) +
+  geom_bar(position = "dodge") +
+  scale_fill_manual(values = c("steelblue", "tomato"),
+                    labels = c("Stayed", "Left")) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Departments by Left", x = "Departments", y = "Count", fill = "Left")
+```
+
+```{r dept-left-counts}
+data_filtered %>%
+  group_by(department, left) %>%
+  summarise(count = n(), .groups = "drop")
+```
+
+**The proportion of left people compare to whole department in percentage by departments:**
+
+So, the most left rate department is from hr = 18.95, accounting = 17.84, sales = 17.62, technical = 17.36, it = 16.83, support = 16.68, marketing = 16.53, product_mng = 15.76, management = 13.89, and the lowest R&D = 12.48 (Positive Result).
+
+```{r countplot-projects-left, fig.width=10, fig.height=6}
+ggplot(data_filtered, aes(x = factor(number_project), fill = factor(left))) +
+  geom_bar(position = "dodge") +
+  scale_fill_manual(values = c("steelblue", "tomato"),
+                    labels = c("Stayed", "Left")) +
+  labs(title = "Number Project by Left", x = "Number Project",
+       y = "Count", fill = "Left") +
+  theme_minimal()
+```
+
+```{r heatmap-dept-projects, fig.width=12, fig.height=8}
+pivot_df <- data_filtered %>%
+  group_by(department, number_project) %>%
+  summarise(left_prop = mean(left), .groups = "drop")
+
+ggplot(pivot_df, aes(x = factor(number_project), y = department, fill = left_prop)) +
+  geom_tile() +
+  geom_text(aes(label = round(left_prop, 2)), size = 3) +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = 0.5) +
+  labs(title = "Proportion of Employees Left by Department and Number of Projects",
+       x = "Number of Projects", y = "Department", fill = "Prop Left") +
+  theme_minimal()
+```
+
+This plot clearly shows that when number of project is 2, turnover rate is high, then decreases from 3, 4 and 5 until 6 number project turnover rate increases until number project 7 where turnover rate is 100%.
+
+```{r boxplot-eval-projects, fig.width=10, fig.height=6}
+ggplot(data_filtered, aes(x = factor(number_project), y = last_evaluation)) +
+  geom_boxplot() +
+  labs(title = "Last Evaluation vs. Number Project",
+       x = "Number Project", y = "Last Evaluation") +
+  theme_minimal()
+```
+
+```{r countplot-salary-left, fig.width=8, fig.height=6}
+ggplot(data_filtered, aes(x = factor(salary, levels=c("low","medium","high")),
+                           fill = factor(left))) +
+  geom_bar(position = "dodge") +
+  scale_fill_manual(values = c("steelblue", "tomato"),
+                    labels = c("Stayed", "Left")) +
+  labs(title = "Salary by Left", x = "Salary", y = "Count", fill = "Left") +
+  theme_minimal()
+```
+
+---
+
+# Modeling
+
+Models to compare:
+
+1. XGBoost
+2. XGBoost + Tuned Parameters
+3. XGBoost + Tuned Parameters + Upsampling
+
+## Prepare data for the first model
+
+```{r prepare-base-data}
+# Define target variable
+y <- data_filtered$left
+
+# Drop target variable and encode categoricals
+X <- data_filtered %>%
+  select(-left) %>%
+  mutate(
+    salary = as.integer(factor(salary, levels = c("low", "medium", "high"))),
+    department = as.integer(factor(department))
+  )
+```
+
+```{r train-test-split-base}
+# Split data into 80/20
+set.seed(0)
+train_idx <- createDataPartition(y, p = 0.8, list = FALSE)
+X_tr <- X[train_idx, ]
+X_test <- X[-train_idx, ]
+y_tr <- y[train_idx]
+y_test <- y[-train_idx]
+```
+
+```{r train-val-split-base}
+# Split train into 60/20 and 20 portion
+set.seed(0)
+val_idx <- createDataPartition(y_tr, p = 0.25, list = FALSE)
+X_train <- X_tr[-val_idx, ]
+X_val <- X_tr[val_idx, ]
+y_train <- y_tr[-val_idx]
+y_val <- y_tr[val_idx]
+
+cat("X_train:", nrow(X_train), "| X_val:", nrow(X_val), "| X_test:", nrow(X_test), "\n")
+```
+
+## #1 XGBoost
+
+```{r xgb-model1, message=FALSE, warning=FALSE}
+# Train XGBoost model
+dtrain <- xgb.DMatrix(data = as.matrix(X_train), label = y_train)
+dval   <- xgb.DMatrix(data = as.matrix(X_val), label = y_val)
+dtest  <- xgb.DMatrix(data = as.matrix(X_test), label = y_test)
+
+params <- list(
+  objective = "binary:logistic",
+  eval_metric = "logloss",
+  max_depth = 4,
+  min_child_weight = 3,
+  eta = 0.01
+)
+
+watchlist <- list(train = dtrain, val = dval)
+
+xgb_model1 <- xgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = 800,
+  watchlist = watchlist,
+  verbose = 0
+)
+```
+
+```{r xgb1-learning-curve, fig.width=10, fig.height=5}
+# Plot training vs validation loss
+eval_log <- xgb_model1$evaluation_log
+
+ggplot(eval_log, aes(x = iter)) +
+  geom_line(aes(y = train_logloss, color = "Train Loss")) +
+  geom_line(aes(y = val_logloss, color = "Validation Loss"), linetype = "dashed") +
+  labs(title = "Training vs Validation Loss (XGBoost #1)",
+       x = "Epochs", y = "Log Loss", color = "") +
+  theme_minimal()
+```
+
+```{r xgb1-predict}
+# Predict on validation and test sets
+y_pred_val1 <- as.integer(predict(xgb_model1, dval) > 0.5)
+y_pred_test1 <- as.integer(predict(xgb_model1, dtest) > 0.5)
+```
+
+```{r xgb1-val-report}
+confusionMatrix(factor(y_pred_val1), factor(y_val), positive = "1")
+```
+
+```{r xgb1-test-report}
+confusionMatrix(factor(y_pred_test1), factor(y_test), positive = "1")
+```
+
+```{r xgb1-confusion-matrix, fig.width=6, fig.height=5}
+cm1 <- table(Predicted = y_pred_test1, Actual = y_test)
+ggplot(as.data.frame(cm1), aes(x = Actual, y = Predicted, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = Freq), size = 6) +
+  scale_fill_gradient(low = "white", high = "steelblue") +
+  labs(title = "Confusion Matrix - XGBoost #1 (Test Set)") +
+  theme_minimal()
+```
+
+```{r xgb1-feature-importance, fig.width=10, fig.height=6}
+importance1 <- xgb.importance(model = xgb_model1)
+xgb.plot.importance(importance1, main = "Feature Importances - XGBoost #1")
+```
+
+```{r xgb1-metrics}
+accuracy  <- mean(y_pred_test1 == y_test)
+precision <- sum(y_pred_test1 == 1 & y_test == 1) / sum(y_pred_test1 == 1)
+recall    <- sum(y_pred_test1 == 1 & y_test == 1) / sum(y_test == 1)
+f1        <- 2 * precision * recall / (precision + recall)
+auc       <- roc(y_test, predict(xgb_model1, dtest))$auc
+
+cat("accuracy:", round(accuracy, 4), "\n")
+cat("precision:", round(precision, 4), "\n")
+cat("recall:", round(recall, 4), "\n")
+cat("f1:", round(f1, 4), "\n")
+cat("auc:", round(auc, 4), "\n")
+```
+
+## #2 XGBoost with Upsampled Only
+
+```{r xgb-model2, message=FALSE, warning=FALSE}
+dtrain2 <- xgb.DMatrix(data = as.matrix(X_train2), label = y_train2)
+dval2   <- xgb.DMatrix(data = as.matrix(X_val2), label = y_val2)
+dtest2  <- xgb.DMatrix(data = as.matrix(X_test2), label = y_test2)
+
+watchlist2 <- list(train = dtrain2, val = dval2)
+
+xgb_model2 <- xgb.train(
+  params = params,
+  data = dtrain2,
+  nrounds = 800,
+  watchlist = watchlist2,
+  verbose = 0
+)
+```
+
+```{r xgb2-learning-curve, fig.width=10, fig.height=5}
+eval_log2 <- xgb_model2$evaluation_log
+
+ggplot(eval_log2, aes(x = iter)) +
+  geom_line(aes(y = train_logloss, color = "Train Loss")) +
+  geom_line(aes(y = val_logloss, color = "Validation Loss"), linetype = "dashed") +
+  labs(title = "Training vs Validation Loss (XGBoost #2 - Upsampled)",
+       x = "Epochs", y = "Log Loss", color = "") +
+  theme_minimal()
+```
+
+```{r xgb2-metrics}
+y_pred_test2 <- as.integer(predict(xgb_model2, dtest2) > 0.5)
+
+accuracy2  <- mean(y_pred_test2 == y_test2)
+precision2 <- sum(y_pred_test2 == 1 & y_test2 == 1) / sum(y_pred_test2 == 1)
+recall2    <- sum(y_pred_test2 == 1 & y_test2 == 1) / sum(y_test2 == 1)
+f12        <- 2 * precision2 * recall2 / (precision2 + recall2)
+auc2       <- roc(y_test2, predict(xgb_model2, dtest2))$auc
+
+cat("accuracy:", round(accuracy2, 4), "\n")
+cat("precision:", round(precision2, 4), "\n")
+cat("recall:", round(recall2, 4), "\n")
+cat("f1:", round(f12, 4), "\n")
+cat("auc:", round(auc2, 4), "\n")
+```
+
+## #3 XGBoost with Tuned Parameters and Upsampled
+
+```{r xgb-model3, message=FALSE, warning=FALSE}
+params3 <- list(
+  objective = "binary:logistic",
+  eval_metric = "logloss",
+  max_depth = 6,
+  min_child_weight = 3,
+  eta = 0.01,
+  subsample = 0.7,
+  colsample_bytree = 0.7,
+  gamma = 0,
+  alpha = 0,
+  lambda = 1
+)
+
+xgb_model3 <- xgb.train(
+  params = params3,
+  data = dtrain2,
+  nrounds = 800,
+  watchlist = watchlist2,
+  verbose = 0
+)
+```
+
+```{r xgb3-metrics}
+y_pred_test3 <- as.integer(predict(xgb_model3, dtest2) > 0.5)
+
+accuracy3  <- mean(y_pred_test3 == y_test2)
+precision3 <- sum(y_pred_test3 == 1 & y_test2 == 1) / sum(y_pred_test3 == 1)
+recall3    <- sum(y_pred_test3 == 1 & y_test2 == 1) / sum(y_test2 == 1)
+f1_3       <- 2 * precision3 * recall3 / (precision3 + recall3)
+auc3       <- roc(y_test2, predict(xgb_model3, dtest2))$auc
+
+cat("accuracy:", round(accuracy3, 4), "\n")
+cat("precision:", round(precision3, 4), "\n")
+cat("recall:", round(recall3, 4), "\n")
+cat("f1:", round(f1_3, 4), "\n")
+cat("auc:", round(auc3, 4), "\n")
+```
+
+---
+
+# Random Forest
+
+## #1 Random Forest (Base)
+
+```{r rf-model1, message=FALSE, warning=FALSE}
+rf_model1 <- randomForest(
+  x = X_train,
+  y = factor(y_train),
+  ntree = 100,
+  max_depth = 10,
+  nodesize = 1,
+  mtry = floor(sqrt(ncol(X_train))),
+  random_state = 0
+)
+```
+
+```{r rf1-metrics}
+y_pred_test_rf1 <- predict(rf_model1, X_test)
+y_pred_test_rf1_num <- as.integer(as.character(y_pred_test_rf1))
+
+accuracy4  <- mean(y_pred_test_rf1_num == y_test)
+precision4 <- sum(y_pred_test_rf1_num == 1 & y_test == 1) / sum(y_pred_test_rf1_num == 1)
+recall4    <- sum(y_pred_test_rf1_num == 1 & y_test == 1) / sum(y_test == 1)
+f1_4       <- 2 * precision4 * recall4 / (precision4 + recall4)
+rf1_probs  <- predict(rf_model1, X_test, type = "prob")[, 2]
+auc4       <- roc(y_test, rf1_probs)$auc
+
+cat("accuracy:", round(accuracy4, 4), "\n")
+cat("precision:", round(precision4, 4), "\n")
+cat("recall:", round(recall4, 4), "\n")
+cat("f1:", round(f1_4, 4), "\n")
+cat("auc:", round(auc4, 4), "\n")
+```
+
+```{r rf1-feature-importance, fig.width=10, fig.height=6}
+rf1_importance <- data.frame(
+  Feature = names(X_train),
+  Importance = rf_model1$importance[, 1]
+) %>% arrange(desc(Importance))
+
+ggplot(rf1_importance, aes(x = reorder(Feature, Importance), y = Importance)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Feature Importances - Random Forest #1",
+       x = "Feature", y = "Mean Decrease in Gini") +
+  theme_minimal()
+```
+
+## #2 Random Forest + Upsampling
+
+```{r rf-model2, message=FALSE, warning=FALSE}
+rf_model2 <- randomForest(
+  x = X_train2,
+  y = factor(y_train2),
+  ntree = 100,
+  nodesize = 1,
+  mtry = floor(sqrt(ncol(X_train2)))
+)
+```
+
+```{r rf2-metrics}
+y_pred_test_rf2 <- predict(rf_model2, X_test2)
+y_pred_test_rf2_num <- as.integer(as.character(y_pred_test_rf2))
+
+accuracy5  <- mean(y_pred_test_rf2_num == y_test2)
+precision5 <- sum(y_pred_test_rf2_num == 1 & y_test2 == 1) / sum(y_pred_test_rf2_num == 1)
+recall5    <- sum(y_pred_test_rf2_num == 1 & y_test2 == 1) / sum(y_test2 == 1)
+f1_5       <- 2 * precision5 * recall5 / (precision5 + recall5)
+rf2_probs  <- predict(rf_model2, X_test2, type = "prob")[, 2]
+auc5       <- roc(y_test2, rf2_probs)$auc
+
+cat("accuracy:", round(accuracy5, 4), "\n")
+cat("precision:", round(precision5, 4), "\n")
+cat("recall:", round(recall5, 4), "\n")
+cat("f1:", round(f1_5, 4), "\n")
+cat("auc:", round(auc5, 4), "\n")
+```
+
+## #3 Random Forest + Tuned Parameters + Upsampled
+
+```{r rf-model3, message=FALSE, warning=FALSE}
+rf_model3 <- randomForest(
+  x = X_train2,
+  y = factor(y_train2),
+  ntree = 300,
+  max_depth = 20,
+  nodesize = 2,
+  mtry = floor(sqrt(ncol(X_train2)))
+)
+```
+
+```{r rf3-metrics}
+y_pred_test_rf3 <- predict(rf_model3, X_test2)
+y_pred_test_rf3_num <- as.integer(as.character(y_pred_test_rf3))
+
+accuracy6  <- mean(y_pred_test_rf3_num == y_test2)
+precision6 <- sum(y_pred_test_rf3_num == 1 & y_test2 == 1) / sum(y_pred_test_rf3_num == 1)
+recall6    <- sum(y_pred_test_rf3_num == 1 & y_test2 == 1) / sum(y_test2 == 1)
+f1_6       <- 2 * precision6 * recall6 / (precision6 + recall6)
+rf3_probs  <- predict(rf_model3, X_test2, type = "prob")[, 2]
+auc6       <- roc(y_test2, rf3_probs)$auc
+
+cat("accuracy:", round(accuracy6, 4), "\n")
+cat("precision:", round(precision6, 4), "\n")
+cat("recall:", round(recall6, 4), "\n")
+cat("f1:", round(f1_6, 4), "\n")
+cat("auc:", round(auc6, 4), "\n")
+```
+
+---
+
+# Logistic Regression
+
+```{r logistic-regression, message=FALSE, warning=FALSE}
+library(glmnet)
+
+# Scale features
+scaler_mean <- colMeans(X_train2)
+scaler_sd   <- apply(X_train2, 2, sd)
+
+X_train_scaled <- scale(X_train2, center = scaler_mean, scale = scaler_sd)
+X_val_scaled   <- scale(X_val2, center = scaler_mean, scale = scaler_sd)
+X_test_scaled  <- scale(X_test2, center = scaler_mean, scale = scaler_sd)
+
+# Logistic Regression with L2 regularization
+log_clf <- glm(
+  y ~ .,
+  data = data.frame(X_train_scaled, y = factor(y_train2)),
+  family = binomial(link = "logit")
+)
+```
+
+```{r logistic-predict}
+# Predict on test set
+log_probs <- predict(log_clf, newdata = data.frame(X_test_scaled), type = "response")
+y_log_pred <- as.integer(log_probs > 0.5)
+
+cat("Test Accuracy:", round(mean(y_log_pred == y_test2), 4), "\n")
+confusionMatrix(factor(y_log_pred), factor(y_test2), positive = "1")
+```
+
+```{r logistic-metrics}
+accuracy7  <- mean(y_log_pred == y_test2)
+precision7 <- sum(y_log_pred == 1 & y_test2 == 1) / sum(y_log_pred == 1)
+recall7    <- sum(y_log_pred == 1 & y_test2 == 1) / sum(y_test2 == 1)
+f1_7       <- 2 * precision7 * recall7 / (precision7 + recall7)
+auc7       <- roc(y_test2, log_probs)$auc
+
+cat("accuracy:", round(accuracy7, 4), "\n")
+cat("precision:", round(precision7, 4), "\n")
+cat("recall:", round(recall7, 4), "\n")
+cat("f1:", round(f1_7, 4), "\n")
+cat("auc:", round(auc7, 4), "\n")
+```
+
+## Champion Model
+
+Base on model performance the champion model would be the base Random Forest (without upsampling and parameter tuning).
+
+After testing the model that included Satisfaction Level, we can say this factor plays a crucial role for employee's decision. However, Satisfaction Level seemingly is not the root cause of the problem — it is the result of the problem. After this I decided to make a new prediction but leaving Satisfaction Level.
+
+## Feature Engineering (Selection)
+
+```{r feature-selection}
+X_train3 <- X_train %>% select(-satisfaction_level)
+X_val3   <- X_val %>% select(-satisfaction_level)
+X_test3  <- X_test %>% select(-satisfaction_level)
+```
+
+```{r rf-model4, message=FALSE, warning=FALSE}
+rf_model4 <- randomForest(
+  x = X_train3,
+  y = factor(y_train),
+  ntree = 100,
+  nodesize = 1,
+  mtry = floor(sqrt(ncol(X_train3)))
+)
+```
+
+```{r rf4-metrics}
+y_pred_test_rf4 <- predict(rf_model4, X_test3)
+y_pred_test_rf4_num <- as.integer(as.character(y_pred_test_rf4))
+
+accuracy8  <- mean(y_pred_test_rf4_num == y_test)
+precision8 <- sum(y_pred_test_rf4_num == 1 & y_test == 1) / sum(y_pred_test_rf4_num == 1)
+recall8    <- sum(y_pred_test_rf4_num == 1 & y_test == 1) / sum(y_test == 1)
+f1_8       <- 2 * precision8 * recall8 / (precision8 + recall8)
+rf4_probs  <- predict(rf_model4, X_test3, type = "prob")[, 2]
+auc8       <- roc(y_test, rf4_probs)$auc
+
+cat("accuracy:", round(accuracy8, 4), "\n")
+cat("precision:", round(precision8, 4), "\n")
+cat("recall:", round(recall8, 4), "\n")
+cat("f1:", round(f1_8, 4), "\n")
+cat("auc:", round(auc8, 4), "\n")
+```
+
+```{r rf4-feature-importance, fig.width=10, fig.height=6}
+rf4_importance <- data.frame(
+  Feature = names(X_train3),
+  Importance = rf_model4$importance[, 1]
+) %>% arrange(desc(Importance))
+
+ggplot(rf4_importance, aes(x = reorder(Feature, Importance), y = Importance)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Feature Importances - Random Forest (Without Satisfaction Level)",
+       x = "Feature", y = "Mean Decrease in Gini") +
+  theme_minimal()
+```
+
+---
+
+# Conclusion
+
+## Score Comparison
+
+```{r score-comparison}
+results <- data.frame(
+  Model = c(
+    'XGBoost',
+    'XGBoost + Upsampled',
+    'XGBoost + Tuned Parameters + Upsampled',
+    'Random Forest',
+    'Random Forest + Upsampled',
+    'Random Forest + Tuned Parameters + Upsampled',
+    'Logistic Regression',
+    'Random Forest (Selection)'
+  ),
+  Accuracy  = c(accuracy, accuracy2, accuracy3, accuracy4, accuracy5, accuracy6, accuracy7, accuracy8),
+  Precision = c(precision, precision2, precision3, precision4, precision5, precision6, precision7, precision8),
+  Recall    = c(recall, recall2, recall3, recall4, recall5, recall6, recall7, recall8),
+  F1        = c(f1, f12, f1_3, f1_4, f1_5, f1_6, f1_7, f1_8),
+  AUC       = c(as.numeric(auc), as.numeric(auc2), as.numeric(auc3),
+                as.numeric(auc4), as.numeric(auc5), as.numeric(auc6),
+                as.numeric(auc7), as.numeric(auc8))
+)
+
+results %>%
+  mutate(across(where(is.numeric), ~round(., 4)))
+```
+
+**Model Select Suggestion:**
+
+- **Champion model:** Performs better with higher score; however, this model includes satisfaction level which is not the root cause of the problem. This model works best when used with datasets that contain satisfaction level.
+
+- **Feature-selected model (without satisfaction_level):** Even though this model's score is lower, it is robust without satisfaction score. This model works best with datasets that do not contain satisfaction level — it is good to predict the leaving of employees by root cause.
+
+## Summary
+
+The core narrative revolves around a **failure to sustain employee satisfaction and engagement beyond the initial years of employment.**
+
+Salifort Motors is experiencing a turnover lifecycle concentrated in years 3-5, driven by a confluence of factors: declining satisfaction after year 2, potential workload imbalances shifting from possible underutilization to overload around years 3-5, perceptions of limited salary progression particularly for longer-tenured staff, restricted and unevenly distributed promotion opportunities, and a dual attrition challenge of losing both high-performing individuals (likely due to burnout/lack of advancement) and potentially under-engaged lower performers.
+
+Addressing this challenge requires a holistic approach focusing on:
+
+- Enhancing employee satisfaction measurement and action planning
+- Re-evaluating workload distribution and management across employee tenure
+- Optimizing compensation structures with a focus on progression and equity
+- Improving promotion processes for transparency and fairness
+- Investing in employee well-being and safety to reduce workload-related risks
+- Implementing targeted initiatives in departments with elevated turnover rates, while always addressing the systemic, company-wide issues as the foundational priority
+
+## Insights
+
+**Analysis of Salifort Motors Employee Turnover: Key Insights**
+
+**1. Core Driver: Employee Satisfaction & the Mid-Tenure Satisfaction Dip**
+
+A central finding is the paramount importance of employee satisfaction as a predictor of attrition. Low satisfaction levels are a critical signal for potential employee departure. Employees who leave exhibit satisfaction scores typically clustered in the 0.0-0.45 range, sharply contrasting with employees who remain (0.6-0.8). A pronounced satisfaction drop occurs at the three-year mark and deepens further in year four — the peak turnover period.
+
+**2. Workload Dynamics: Imbalance Over Time**
+
+Two distinct groups leave: an underutilized group (125-160 hours/month, lower evaluation) and an overburdened group (220-320 hours/month, high evaluation scores, near-zero satisfaction). Average monthly hours decrease from year 2 to year 3, then rise in years 4-5 — a pattern suggesting workload imbalance progression.
+
+**3. Time-in-Company Lifecycle & the Critical Years 3-5**
+
+Turnover dramatically escalates after the first two years, peaking between years 3-5. Year 5 stands out with near parity between leavers and stayers.
+
+**4. Compensation: Salary Levels and Progression**
+
+Lower salary bands demonstrate significantly higher turnover. The proportion of employees in the low salary band increases notably at year 5, while the high salary band proportion drops sharply — suggesting limited upward salary mobility for tenured employees.
+
+**5. Performance Evaluation: Turnover at Both Ends**
+
+Attrition is observed among both high performers (0.8-1.0 evaluation) and lower performers (0.4-0.6 evaluation), while stable mid-range performers (0.6-0.8) are more likely to stay.
+
+**6. Promotion Opportunities: Scarcity and Departmental Disparities**
+
+Overall promotion rates are low, and opportunities are unevenly distributed. Management (4.72%) and Marketing (3.73%) have the highest rates; IT (0.22%) and Product Management (0%) have the lowest.
+
+## Recommendations
+
+1. **Proactively measure and act on employee satisfaction** through regular pulse surveys, lifecycle surveys at tenure milestones, and enhanced exit interviews.
+
+2. **Optimize workload management** by addressing underutilization in years 1-2 and mitigating overload risk in years 3-5+ through project portfolio management and burnout prevention programs.
+
+3. **Enhance compensation** through competitive salary benchmarking, transparent progression paths, merit-based increases, and holistic recognition programs.
+
+4. **Expand promotion opportunities** by increasing transparency, creating clear career paths, and investing in employee development and mentoring.
+
+5. **Prioritize employee well-being and safety** through enhanced safety protocols, EAP programs, and manager training on burnout recognition.
+
+6. **Focus retention efforts on mid-tenure employees (years 3-5)** through formal mid-career check-in programs and targeted development opportunities.
+
+## Next Steps
+
+- **Pilot Programs and A/B Testing** for new initiatives before company-wide rollout
+- **Integration of predictive models into HR systems** for real-time attrition risk monitoring
+- **Continuous monitoring** of KPIs for retention, satisfaction, and workload metrics
+- **Longitudinal data analysis** to understand trends over time
+- **Qualitative research** via focus groups and employee interviews to enrich quantitative findings
+- **External data integration** with industry benchmarks and economic indicators
+
+---
+
+*Note: This analysis involved AI assistance.*
